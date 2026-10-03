@@ -1,0 +1,189 @@
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+import time
+import re
+import ollama
+import mysql.connector
+
+# --- Configuración ---
+NOMBRE_CONTACTO = "Pata de lana"
+
+ESQUEMA = """Tabla usuario(
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    nombre VARCHAR(50),
+    apellido VARCHAR(50),
+    dni INT
+)"""
+
+
+# --- Conexión a BD ---
+def conectar_bd():
+    return mysql.connector.connect(
+        host='localhost',
+        user='root',
+        password='',
+        database='usuario'
+    )
+
+
+# --- Paso 1: Generar SQL a partir del mensaje ---
+def generar_sql(mensaje: str) -> str:
+    prompt = f"""/no_think
+Sos un generador de consultas MySQL. Dado el siguiente esquema:
+{ESQUEMA}
+
+Generá ÚNICAMENTE la consulta SQL (SELECT) que responda al pedido del usuario.
+No agregues explicaciones, ni texto adicional, ni bloques de markdown.
+Si el pedido no se puede responder con una consulta SELECT sobre la tabla 'usuario', respondé exactamente: NO_CONSULTA
+
+Pedido: {mensaje}"""
+
+    respuesta = ollama.generate(model='qwen3:4b', prompt=prompt)['response']
+    respuesta = re.sub(r"<think>.*?</think>", "", respuesta, flags=re.DOTALL)
+    respuesta = re.sub(r"```(?:sql)?", "", respuesta, flags=re.IGNORECASE)
+    return respuesta.strip().rstrip(";").strip()
+
+
+# --- Validación de seguridad ---
+def es_consulta_segura(sql: str) -> bool:
+    sql_min = sql.lower().strip()
+    if not sql_min.startswith("select"):
+        return False
+    if ";" in sql:
+        return False
+    prohibidas = ["insert", "update", "delete", "drop", "alter",
+                  "truncate", "create", "grant", "into outfile"]
+    return not any(re.search(rf"\b{p}\b", sql_min) for p in prohibidas)
+
+
+# --- Paso 2: Ejecutar SQL y obtener resultados ---
+def ejecutar_consulta(sql: str):
+    conexion = conectar_bd()
+    cursor = conexion.cursor(dictionary=True)
+    try:
+        cursor.execute(sql)
+        resultados = cursor.fetchall()
+        return resultados
+    except mysql.connector.Error as err:
+        return f"Error SQL: {err}"
+    finally:
+        cursor.close()
+        conexion.close()
+
+
+# --- Paso 3: Generar respuesta natural con los resultados ---
+def generar_respuesta_natural(mensaje: str, resultados) -> str:
+    prompt = f"""Sos una recepcionista amable de una inmobiliaria.
+El cliente envió este mensaje por WhatsApp: "{mensaje}"
+
+Consultaste la base de datos y obtuviste este resultado:
+{resultados}
+
+Respondé al cliente de forma natural, breve y cordial (como si fuera un mensaje de WhatsApp).
+No menciones bases de datos, SQL ni términos técnicos. Solo dá la respuesta."""
+
+    respuesta = ollama.generate(model='qwen3:4b', prompt=prompt)['response']
+    respuesta = re.sub(r"<think>.*?</think>", "", respuesta, flags=re.DOTALL)
+    return respuesta.strip()
+
+
+# --- Función principal que procesa un mensaje ---
+def procesar_mensaje(mensaje: str):
+    print(f"\n📩 Mensaje recibido: {mensaje}")
+    
+    # 1. Generar SQL
+    sql = generar_sql(mensaje)
+    print(f"🔧 SQL generado: {sql}")
+    
+    # 2. Validar
+    if sql == "NO_CONSULTA" or not es_consulta_segura(sql):
+        # No se puede responder con la BD, generar respuesta genérica
+        respuesta = generar_respuesta_natural(mensaje, "No hay información relevante en la base de datos.")
+        print(f"🤖 Respuesta IA: {respuesta}")
+        return
+    
+    # 3. Ejecutar
+    resultados = ejecutar_consulta(sql)
+    print(f"🗄️ Resultados BD: {resultados}")
+    
+    # 4. Generar respuesta natural
+    respuesta = generar_respuesta_natural(mensaje, resultados)
+    print(f"🤖 Respuesta IA: {respuesta}")
+
+
+# --- Selenium: conexión a WhatsApp ---
+options = Options()
+options.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
+driver = webdriver.Chrome(options=options)
+
+print("Conectado a WhatsApp Web")
+print(f"Buscando mensajes de: {NOMBRE_CONTACTO}")
+
+ultimo_mensaje = None
+ultimo_id_mensaje = None
+
+while True:
+    try:
+        # --- Encontrar y hacer clic en el contacto ---
+        contacto = driver.find_element(By.CSS_SELECTOR, f'[title="{NOMBRE_CONTACTO}"]')
+        
+        try:
+            header_title = driver.find_element(
+                By.CSS_SELECTOR,
+                'span[data-testid="conversation-info-header-chat-title"]'
+            ).text
+            if header_title != NOMBRE_CONTACTO:
+                contacto.click()
+                time.sleep(1.5)
+        except:
+            contacto.click()
+            time.sleep(1.5)
+
+        # --- Buscar mensajes ---
+        mensajes = driver.find_elements(By.CSS_SELECTOR, 'div[data-id]')
+
+        if not mensajes:
+            time.sleep(2)
+            continue
+
+        # --- Identificar el último mensaje entrante ---
+        for msg in reversed(mensajes):
+            msg_id = msg.get_attribute('data-id')
+            
+            if msg_id == ultimo_id_mensaje:
+                break
+
+            es_mensaje_saliente = False
+            try:
+                msg.find_element(By.CSS_SELECTOR, 'span[data-testid="tail-out"]')
+                es_mensaje_saliente = True
+            except:
+                pass
+
+            if not es_mensaje_saliente:
+                try:
+                    texto_elemento = msg.find_element(
+                        By.CSS_SELECTOR,
+                        'span[data-testid="selectable-text"]'
+                    )
+                    texto_mensaje = texto_elemento.text.strip()
+                    
+                    if texto_mensaje and texto_mensaje != ultimo_mensaje:
+                        ultimo_mensaje = texto_mensaje
+                        ultimo_id_mensaje = msg_id
+                        
+                        # 🚀 Aquí procesamos el mensaje con la IA
+                        procesar_mensaje(texto_mensaje)
+                
+                except Exception as e:
+                    ultimo_id_mensaje = msg_id
+
+            if not es_mensaje_saliente and msg_id == ultimo_id_mensaje:
+                break
+
+        time.sleep(2)
+
+    except Exception as e:
+        print(f"Esperando a {NOMBRE_CONTACTO}...")
+        time.sleep(3)
