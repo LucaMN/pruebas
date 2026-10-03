@@ -1,0 +1,8 @@
+#Levantar Ollama
+    ollama run qwen3:4b
+
+#Abrir chrome con depuracion Remota
+    start "" "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="%USERPROFILE%\chrome-whatsapp"
+
+#Entrar a whatsapp
+    https://web.whatsapp.com
